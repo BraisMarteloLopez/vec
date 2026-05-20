@@ -2,9 +2,41 @@
 
 ## Visión General
 
-Pipeline multimodal basado en LangGraph para identificar modelos de aeronaves
-a partir de imágenes, mediante extracción estructurada de características y
-razonamiento condicional.
+Sistema para identificar vehículos a partir de imágenes (objetivo inicial:
+**helicópteros**) descomponiendo la observación en **características discriminantes**
+curadas por un experto humano. En lugar de preguntar al modelo "¿qué helicóptero es?"
+de forma abierta, el sistema interroga al modelo multimodal **una característica a la
+vez**, con una pregunta concreta y contexto que guía en qué fijarse.
+
+### Reparto de trabajo
+
+- **Trabajo humano (conocimiento experto, offline):** definir, por tipo de vehículo,
+  el catálogo de características a reconocer. Por cada característica se aporta: la
+  **pregunta** concreta, el **contexto** (en qué fijarse al mirar la imagen) y
+  **ejemplos** concretos de lo que se busca identificar.
+- **Trabajo autónomo (runtime):** un flujo que recorre ese catálogo y, por cada
+  característica, construye **un único prompt** (pregunta + contexto + ejemplos), lo
+  envía al modelo multimodal y guarda la respuesta **validada característica por
+  característica**.
+
+### Hipótesis de diseño
+
+`Gemma-4` detecta rasgos concretos con alta fiabilidad cuando la pregunta es
+**estrecha y va acompañada de ejemplos** de qué buscar. Preguntar característica a
+característica (con su contexto) produce una validación más fiable, auditable y
+controlable por el experto que una sola pregunta abierta de identificación.
+
+### Fases
+
+| Fase | Alcance | Estado |
+|---|---|---|
+| **1 — Extracción de características** | Catálogo humano + flujo que pregunta una característica por prompt y recoge respuestas validadas | **Foco actual** |
+| **2 — Identificación** | Razonar sobre la evidencia agregada para proponer el/los modelo(s) | **Posterior — a definir** |
+
+> El diseño de la **Fase 2** (nodo `identifier`, schemas `Candidate`/`Report` y
+> `IDENTIFY_PROMPT_TEMPLATE` que aparecen más abajo) es un **boceto preliminar**: se
+> redefinirá cuando se aborde esa fase. La especificación firme de este documento es
+> la **Fase 1**.
 
 ---
 
@@ -91,9 +123,11 @@ vehicle_identifier/
 # models.py — schemas clave
 
 class Feature(BaseModel):
-    id: str                         # "rotor_blade_count"
+    id: str                         # "main_rotor_blade_count"
     category: str                   # "rotor" | "fuselage" | "tail" | etc.
-    question: str                   # Pregunta exacta al LLM
+    question: str                   # Pregunta concreta sobre ESTA característica
+    context: str                    # Guía de en qué fijarse al observar la imagen
+    examples: list[str]             # Ejemplos concretos de lo que se busca / valores posibles
     followup_questions: list[str]   # Preguntas adicionales si confianza < umbral
     required: bool                  # Si es obligatoria para la identificación
 
@@ -104,6 +138,7 @@ class FeatureResult(BaseModel):
     confidence: float               # 0.0 - 1.0
     raw_response: str               # Respuesta completa del LLM
 
+# --- FASE 2 (boceto preliminar — a redefinir): identificación ---
 class Candidate(BaseModel):
     model_name: str                 # "Mil Mi-17"
     score: float                    # 0.0 - 1.0
@@ -207,7 +242,7 @@ followup_queue vacía     → aggregator
 
 ---
 
-### Nodo 5 — `identifier`
+### Nodo 5 — `identifier`  *(FASE 2 — boceto preliminar, a redefinir)*
 
 **Entrada:** `evidence_summary`, `aircraft_class`, `image_b64`
 **Salida:** `candidates`, `final_report`
@@ -283,14 +318,22 @@ Analiza esta imagen y clasifica la aeronave. Responde ÚNICAMENTE con JSON:
 """
 
 FEATURE_PROMPT_TEMPLATE = """
-Analiza esta imagen y responde a la siguiente pregunta sobre la aeronave.
-Pregunta: {question}
-Responde ÚNICAMENTE con JSON:
-{"value": "<descripción concreta>",
- "confidence": <0.0-1.0>,
- "observations": "<detalles adicionales relevantes>"}
+Analiza esta imagen y céntrate EXCLUSIVAMENTE en una característica del vehículo.
+
+Característica: {question}
+
+En qué fijarte: {context}
+
+Ejemplos de lo que se busca identificar:
+{examples}
+
+Responde ÚNICAMENTE con JSON válido, sin texto adicional:
+{{"value": "<descripción concreta de lo observado>",
+  "confidence": <0.0-1.0>,
+  "observations": "<detalles relevantes; indica si no hay evidencia suficiente>"}}
 """
 
+# FASE 2 (boceto preliminar — a redefinir cuando se aborde la identificación)
 IDENTIFY_PROMPT_TEMPLATE = """
 Eres un experto en identificación de aeronaves militares y civiles.
 A continuación tienes las características extraídas de una aeronave:
@@ -313,6 +356,12 @@ Identifica el modelo exacto o los modelos más probables. Responde ÚNICAMENTE c
 """
 ```
 
+> **Nota sobre los prompts.** `FEATURE_PROMPT_TEMPLATE` se rellena con `str.format()`,
+> por lo que las llaves literales del JSON van escapadas como `{{ }}`. La variable
+> `{examples}` se renderiza como lista (un ejemplo por línea) antes de formatear. El
+> forzado de JSON debe apoyarse en la salida estructurada del endpoint (vLLM
+> `guided_json` / `response_format`), no solo en pedirlo en el texto.
+
 ---
 
 ## Ejemplo de Feature (single rotor)
@@ -323,8 +372,15 @@ Identifica el modelo exacto o los modelos más probables. Responde ÚNICAMENTE c
 Feature(
     id="main_rotor_blade_count",
     category="rotor",
-    question="¿Cuántas palas tiene el rotor principal de esta aeronave? "
-             "Describe también su forma (rectas, escalonadas, en flecha).",
+    question="¿Cuántas palas tiene el rotor principal y qué forma/anchura tienen?",
+    context="Cuenta las palas ancladas al cubo del rotor principal (eje vertical sobre "
+            "el fuselaje); ignora el rotor de cola. Fíjate en el ancho relativo de la "
+            "pala y en si la punta es recta, en flecha o doblada.",
+    examples=[
+        "3 palas rectas y estrechas",
+        "5 palas anchas con punta en flecha",
+        "palas con doblez hacia abajo en la punta (blade tip curl)",
+    ],
     followup_questions=[
         "Observa el cubo del rotor principal. ¿Puedes confirmar el número exacto de palas?",
         "¿Las palas del rotor tienen doblado en las puntas (blade tip curl)?",
@@ -334,8 +390,16 @@ Feature(
 Feature(
     id="tail_rotor_config",
     category="tail",
-    question="¿Tiene rotor de cola convencional, fenestron (rotor en túnel), "
-             "NOTAR (no tail rotor), o es un diseño coaxial sin rotor de cola?",
+    question="¿Qué tipo de rotor de cola tiene?",
+    context="Mira la parte trasera, en la base del estabilizador vertical. Distingue "
+            "entre rotor de cola convencional expuesto, fenestron (rotor carenado dentro "
+            "de un conducto), NOTAR (sin rotor visible, salida de aire en el botalón) o "
+            "diseño coaxial (sin rotor de cola, dos rotores principales contrarrotativos).",
+    examples=[
+        "rotor de cola convencional de 2-4 palas expuesto",
+        "fenestron (rotor embutido en el carenado de la deriva)",
+        "NOTAR: botalón liso sin rotor de cola",
+    ],
     followup_questions=[
         "¿El rotor de cola está montado a izquierda o derecha del estabilizador vertical?",
         "¿Cuántas palas tiene el rotor de cola?",
@@ -345,8 +409,16 @@ Feature(
 Feature(
     id="engine_count_position",
     category="propulsion",
-    question="¿Cuántos motores tiene y dónde están montados? "
-             "(encima del fuselaje, laterales, integrados en la nariz, etc.)",
+    question="¿Cuántos motores tiene y dónde están montados?",
+    context="Localiza los carenados de motor y las tomas/escapes. En helicópteros suelen "
+            "ir sobre el fuselaje, a los lados de la transmisión principal o integrados en "
+            "la nariz. Cuenta tomas de aire y toberas de escape diferenciadas para inferir "
+            "el número.",
+    examples=[
+        "1 motor sobre el fuselaje con escape lateral",
+        "2 motores laterales a ambos lados del rotor principal",
+        "2 motores con tomas de aire sobre la cabina",
+    ],
     followup_questions=[
         "¿Los escapes de los motores son laterales, hacia arriba o hacia atrás?",
         "¿Se aprecian tomas de aire diferenciadas o son integrales con la carcasa?",
@@ -369,6 +441,6 @@ Feature(
 | 6 | `nodes/extractor.py` | Nodo 2 + 3b |
 | 7 | `nodes/checker.py` | Nodo 3 con lógica condicional |
 | 8 | `nodes/aggregator.py` | Nodo 4 |
-| 9 | `nodes/identifier.py` | Nodo 5 + generación de report |
+| 9 | `nodes/identifier.py` | Nodo 5 + generación de report — **Fase 2** |
 | 10 | `graph.py` | Ensamblaje final |
 | 11 | `run.py` | CLI + tests de integración |
