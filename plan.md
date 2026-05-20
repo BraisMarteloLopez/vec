@@ -66,24 +66,17 @@ class AircraftState(BaseModel):
 
     # Clasificación inicial
     aircraft_class: str | None              # "single_rotor" | "tandem" | "fixed_wing" | "multirotor"
-    classification_confidence: float        # 0.0 - 1.0
 
-    # Feature extraction
-    feature_queue: list[Feature]            # preguntas pendientes de la rama activa
+    # Feature extraction (una sola pasada: un prompt por característica)
+    feature_queue: list[Feature]            # características pendientes de la rama activa
     features_done: list[FeatureResult]      # respuestas completadas
-    low_confidence_flags: list[str]         # IDs de features con confianza < umbral
 
-    # Follow-up
-    followup_queue: list[Feature]           # preguntas de seguimiento generadas condicionalmente
-    followup_done: list[FeatureResult]      # respuestas de seguimiento
-
-    # Identificación
-    candidates: list[Candidate]            # top-3 modelos con score
-    final_report: Report | None            # output final
+    # Identificación — FASE 2 (a definir)
+    candidates: list[Candidate]             # top-3 modelos con score
+    final_report: Report | None             # output final
 
     # Control
-    iteration_count: int                   # salvaguarda anti-loop
-    errors: list[str]                      # errores no fatales acumulados
+    errors: list[str]                       # errores no fatales acumulados
 ```
 
 ---
@@ -102,11 +95,10 @@ vehicle_identifier/
 │
 ├── nodes/
 │   ├── __init__.py
-│   ├── classifier.py               # Nodo 1: detecta clase de aeronave
-│   ├── extractor.py                # Nodo 2: ejecuta feature queries en loop
-│   ├── checker.py                  # Nodo 3: evalúa confianza, genera follow-ups
-│   ├── aggregator.py               # Nodo 4: consolida evidencia
-│   └── identifier.py               # Nodo 5: identificación final + report
+│   ├── classifier.py               # Nodo 1: detecta clase de vehículo
+│   ├── extractor.py                # Nodo 2: un prompt por característica (una pasada)
+│   ├── aggregator.py               # Nodo 3: consolida evidencia
+│   └── identifier.py               # Nodo 4: identificación final + report (Fase 2)
 │
 ├── models.py                       # Pydantic schemas: State, Feature, Result, Report
 ├── client.py                       # Wrapper del cliente vLLM (reutiliza _test_.py logic)
@@ -128,14 +120,13 @@ class Feature(BaseModel):
     question: str                   # Pregunta concreta sobre ESTA característica
     context: str                    # Guía de en qué fijarse al observar la imagen
     examples: list[str]             # Ejemplos concretos de lo que se busca / valores posibles
-    followup_questions: list[str]   # Preguntas adicionales si confianza < umbral
     required: bool                  # Si es obligatoria para la identificación
 
 class FeatureResult(BaseModel):
     feature_id: str
-    value: str                      # Respuesta en lenguaje natural
+    value: str                      # Respuesta concreta sobre la característica
+    reasoning: str                  # Razonamiento del LLM sobre esta característica
     structured: dict                # Parsed JSON de la respuesta
-    confidence: float               # 0.0 - 1.0
     raw_response: str               # Respuesta completa del LLM
 
 # --- FASE 2 (boceto preliminar — a redefinir): identificación ---
@@ -162,11 +153,11 @@ class Report(BaseModel):
 ### Nodo 1 — `classifier`
 
 **Entrada:** `image_b64`
-**Salida:** `aircraft_class`, `classification_confidence`
+**Salida:** `aircraft_class`
 
 - Una sola llamada multimodal
-- Pregunta abierta: identifica el tipo general de aeronave
-- Fuerza respuesta en JSON: `{"class": "...", "confidence": 0.x, "reasoning": "..."}`
+- Pregunta abierta: identifica el tipo general de vehículo
+- Fuerza respuesta en JSON: `{"class": "...", "reasoning": "..."}`
 - Carga la `feature_queue` correspondiente a la clase detectada
 
 **Edge condicional de salida:**
@@ -183,66 +174,30 @@ aircraft_class == "unknown"       → END (con error)
 ### Nodo 2 — `extractor`
 
 **Entrada:** `feature_queue`, `image_b64`
-**Salida:** `features_done`, `low_confidence_flags`
+**Salida:** `features_done`
 
-- Itera sobre `feature_queue` (10-25 preguntas según la rama)
-- Una llamada multimodal por Feature
-- Cada llamada fuerza respuesta JSON con schema `FeatureResult`
+- Itera sobre `feature_queue` en una sola pasada (un prompt por característica)
+- Una llamada multimodal por Feature; el prompt combina pregunta + contexto + ejemplos
+- Cada llamada fuerza respuesta JSON con schema `FeatureResult` (incluye `reasoning`)
 - Acumula resultados en `features_done`
-- Marca en `low_confidence_flags` cualquier resultado con `confidence < 0.6`
 
-**Edge condicional de salida:**
-```
-len(low_confidence_flags) > 0  → checker
-len(low_confidence_flags) == 0 → aggregator
-```
+**Edge de salida:** siempre → `aggregator`
 
 ---
 
-### Nodo 3 — `checker`
+### Nodo 3 — `aggregator`
 
-**Entrada:** `low_confidence_flags`, `features_done`, `image_b64`
-**Salida:** `followup_queue` poblado
+**Entrada:** `features_done`
+**Salida:** `evidence_summary` (dict compacto: `feature_id` → `value` / `reasoning`)
 
-- Para cada feature con baja confianza, carga sus `followup_questions`
-- Opcionalmente genera follow-ups dinámicos adicionales via LLM
-- Limita a `MAX_FOLLOWUPS = 10` para evitar loops
-- Controla `iteration_count` como salvaguarda
-
-**Edge condicional de salida:**
-```
-followup_queue no vacía  → followup_extractor (variante de extractor para follow-ups)
-followup_queue vacía     → aggregator
-```
-
----
-
-### Nodo 3b — `followup_extractor`
-
-**Entrada:** `followup_queue`, `image_b64`
-**Salida:** `followup_done`
-
-- Idéntico a `extractor` pero opera sobre `followup_queue`
-- Los resultados se guardan en `followup_done` (no sobreescriben `features_done`)
-- Siempre va a `aggregator` al terminar (sin más bifurcaciones)
-
----
-
-### Nodo 4 — `aggregator`
-
-**Entrada:** `features_done`, `followup_done`
-**Salida:** Estado enriquecido listo para identificación
-
-- Fusiona `features_done` + `followup_done`
-- Resuelve contradicciones: si dos features dan valores incompatibles, marca ambas
-- Calcula confianza media global
-- Construye `evidence_summary` como dict compacto para el prompt de identificación
+- Consolida `features_done` en una estructura compacta
+- Construye `evidence_summary`, que alimentará la identificación (Fase 2)
 
 **Edge:** siempre → `identifier`
 
 ---
 
-### Nodo 5 — `identifier`  *(FASE 2 — boceto preliminar, a redefinir)*
+### Nodo 4 — `identifier`  *(FASE 2 — boceto preliminar, a redefinir)*
 
 **Entrada:** `evidence_summary`, `aircraft_class`, `image_b64`
 **Salida:** `candidates`, `final_report`
@@ -266,16 +221,14 @@ from langgraph.graph import StateGraph, END
 def build_graph():
     graph = StateGraph(AircraftState)
 
-    graph.add_node("classifier",         classifier_node)
-    graph.add_node("extractor",          extractor_node)
-    graph.add_node("checker",            checker_node)
-    graph.add_node("followup_extractor", followup_extractor_node)
-    graph.add_node("aggregator",         aggregator_node)
-    graph.add_node("identifier",         identifier_node)
+    graph.add_node("classifier", classifier_node)
+    graph.add_node("extractor",  extractor_node)
+    graph.add_node("aggregator", aggregator_node)
+    graph.add_node("identifier", identifier_node)   # FASE 2
 
     graph.set_entry_point("classifier")
 
-    # classifier → rama según tipo de aeronave
+    # classifier → rama según tipo de vehículo
     graph.add_conditional_edges("classifier", route_by_class, {
         "single_rotor": "extractor",
         "tandem":       "extractor",
@@ -284,21 +237,10 @@ def build_graph():
         "unknown":      END,
     })
 
-    # extractor → checker si hay baja confianza, si no directo a aggregator
-    graph.add_conditional_edges("extractor", route_by_confidence, {
-        "needs_followup": "checker",
-        "ok":             "aggregator",
-    })
-
-    # checker → followup_extractor si hay follow-ups, si no directo a aggregator
-    graph.add_conditional_edges("checker", route_by_followup, {
-        "has_followups": "followup_extractor",
-        "skip":          "aggregator",
-    })
-
-    graph.add_edge("followup_extractor", "aggregator")
-    graph.add_edge("aggregator",         "identifier")
-    graph.add_edge("identifier",         END)
+    # una sola pasada de extracción, sin re-preguntas condicionales
+    graph.add_edge("extractor",  "aggregator")
+    graph.add_edge("aggregator", "identifier")      # identifier = FASE 2
+    graph.add_edge("identifier", END)
 
     return graph.compile()
 ```
@@ -311,10 +253,9 @@ def build_graph():
 # prompts.py
 
 CLASSIFY_PROMPT = """
-Analiza esta imagen y clasifica la aeronave. Responde ÚNICAMENTE con JSON:
+Analiza esta imagen y clasifica el vehículo. Responde ÚNICAMENTE con JSON:
 {"class": "<single_rotor|tandem|fixed_wing|multirotor|unknown>",
- "confidence": <0.0-1.0>,
- "reasoning": "<breve justificación>"}
+ "reasoning": "<justificación de la clase elegida>"}
 """
 
 FEATURE_PROMPT_TEMPLATE = """
@@ -327,10 +268,9 @@ En qué fijarte: {context}
 Ejemplos de lo que se busca identificar:
 {examples}
 
-Responde ÚNICAMENTE con JSON válido, sin texto adicional:
+Razona sobre lo que observas y responde ÚNICAMENTE con JSON válido, sin texto adicional:
 {{"value": "<descripción concreta de lo observado>",
-  "confidence": <0.0-1.0>,
-  "observations": "<detalles relevantes; indica si no hay evidencia suficiente>"}}
+  "reasoning": "<razonamiento sobre la característica: qué ves y por qué; indica si no hay evidencia suficiente>"}}
 """
 
 # FASE 2 (boceto preliminar — a redefinir cuando se aborde la identificación)
@@ -356,11 +296,13 @@ Identifica el modelo exacto o los modelos más probables. Responde ÚNICAMENTE c
 """
 ```
 
-> **Nota sobre los prompts.** `FEATURE_PROMPT_TEMPLATE` se rellena con `str.format()`,
-> por lo que las llaves literales del JSON van escapadas como `{{ }}`. La variable
-> `{examples}` se renderiza como lista (un ejemplo por línea) antes de formatear. El
-> forzado de JSON debe apoyarse en la salida estructurada del endpoint (vLLM
-> `guided_json` / `response_format`), no solo en pedirlo en el texto.
+> **Nota sobre los prompts.** El `FEATURE_PROMPT_TEMPLATE` es un **borrador pendiente de
+> diseño**: la idea es que el modelo **razone** sobre la característica concreta (no que
+> emita una confianza numérica). Se rellena con `str.format()`, por lo que las llaves
+> literales del JSON van escapadas como `{{ }}` y `{examples}` se renderiza como lista
+> (un ejemplo por línea) antes de formatear. El forzado de JSON debe apoyarse en la
+> salida estructurada del endpoint (vLLM `guided_json` / `response_format`), no solo en
+> pedirlo en el texto.
 
 ---
 
@@ -381,10 +323,6 @@ Feature(
         "5 palas anchas con punta en flecha",
         "palas con doblez hacia abajo en la punta (blade tip curl)",
     ],
-    followup_questions=[
-        "Observa el cubo del rotor principal. ¿Puedes confirmar el número exacto de palas?",
-        "¿Las palas del rotor tienen doblado en las puntas (blade tip curl)?",
-    ],
     required=True,
 ),
 Feature(
@@ -399,10 +337,6 @@ Feature(
         "rotor de cola convencional de 2-4 palas expuesto",
         "fenestron (rotor embutido en el carenado de la deriva)",
         "NOTAR: botalón liso sin rotor de cola",
-    ],
-    followup_questions=[
-        "¿El rotor de cola está montado a izquierda o derecha del estabilizador vertical?",
-        "¿Cuántas palas tiene el rotor de cola?",
     ],
     required=True,
 ),
@@ -419,10 +353,6 @@ Feature(
         "2 motores laterales a ambos lados del rotor principal",
         "2 motores con tomas de aire sobre la cabina",
     ],
-    followup_questions=[
-        "¿Los escapes de los motores son laterales, hacia arriba o hacia atrás?",
-        "¿Se aprecian tomas de aire diferenciadas o son integrales con la carcasa?",
-    ],
     required=True,
 ),
 ```
@@ -433,14 +363,13 @@ Feature(
 
 | Paso | Fichero(s) | Descripción |
 |---|---|---|
-| 1 | `models.py` | Schemas Pydantic completos |
-| 2 | `config/features_*.py` | Las 4 listas de features (10-20 por rama) |
-| 3 | `prompts.py` | Todos los prompts |
+| 1 | `models.py` | Schemas Pydantic Fase 1 (State, Feature, FeatureResult) |
+| 2 | `config/features_*.py` | Listas de características por rama (pregunta + contexto + ejemplos) |
+| 3 | `prompts.py` | Prompts de clasificación y de característica |
 | 4 | `client.py` | Wrapper vLLM con JSON forcing |
 | 5 | `nodes/classifier.py` | Nodo 1 |
-| 6 | `nodes/extractor.py` | Nodo 2 + 3b |
-| 7 | `nodes/checker.py` | Nodo 3 con lógica condicional |
-| 8 | `nodes/aggregator.py` | Nodo 4 |
-| 9 | `nodes/identifier.py` | Nodo 5 + generación de report — **Fase 2** |
-| 10 | `graph.py` | Ensamblaje final |
-| 11 | `run.py` | CLI + tests de integración |
+| 6 | `nodes/extractor.py` | Nodo 2 (una sola pasada) |
+| 7 | `nodes/aggregator.py` | Nodo 3 |
+| 8 | `graph.py` | Ensamblaje final |
+| 9 | `run.py` | CLI + tests de integración |
+| 10 | `nodes/identifier.py` | Nodo 4 + report — **Fase 2 (a definir)** |
