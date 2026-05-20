@@ -1,0 +1,3 @@
+pydantic>=2
+openai>=1.40
+# langgraph  # se usará en la Fase 2 (agregación/identificación)
